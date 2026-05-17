@@ -1,0 +1,38 @@
+{
+  "name": "sales-agent",
+  "version": "1.0.0",
+  "description": "Autonomous Sales Agent for Kazakhstani market",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc --noEmit false",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "scrape": "ts-node src/scraper.ts",
+    "analyze": "ts-node src/analyzer.ts",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.15",
+    "better-sqlite3": "^9.4.3",
+    "node-cron": "^3.0.3",
+    "playwright": "^1.44.0",
+    "qrcode-terminal": "^0.12.0",
+    "telegraf": "^4.16.3",
+    "whatsapp-web.js": "^1.23.0",
+    "winston": "^3.13.0",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "openai": "^4.52.7",
+    "agent-browser": "^0.27.0",
+    "telegram": "^2.26.13",
+    "input": "^1.0.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.10",
+    "@types/node": "^20.14.9",
+    "@types/node-cron": "^3.0.11",
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^5.5.3",
+    "ts-node": "^10.9.2"
+  }
+}

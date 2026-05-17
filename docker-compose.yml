@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  sales-agent:
+    build: .
+    container_name: sales-agent
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./whatsapp-session:/app/whatsapp-session
+      - ./.env:/app/.env
+    environment:
+      - NODE_ENV=production
+    network_mode: "host"
