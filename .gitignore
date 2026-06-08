@@ -1,0 +1,27 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+
+# Runtime data
+data/
+logs/
+scratch/
+whatsapp-session/
+whatsapp-session-*/
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+
+# Playwright / Puppeteer
+.playwright/
+.wwebjs_auth/
+.wwebjs_cache/

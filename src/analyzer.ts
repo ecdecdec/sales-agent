@@ -1,24 +1,10 @@
+import 'dotenv/config';
 import { OpenAI } from 'openai';
-import { dbHelpers, BusinessRecord } from './db';
-import winston from 'winston';
-import { exec } from 'child_process';
-import util from 'util';
+import { dbHelpers, BusinessRecord, normalizePhone } from './db';
+import { createLogger } from './logger';
 
-const execPromise = util.promisify(exec);
+const logger = createLogger('analyzer');
 
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.File({ filename: 'logs/analyzer.log' }),
-    new winston.transports.Console()
-  ]
-});
-
-// Configure Azure OpenAI
 const openai = new OpenAI({
   apiKey: process.env.AZURE_OPENAI_API_KEY,
   baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
@@ -26,128 +12,211 @@ const openai = new OpenAI({
   defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY },
 });
 
+const DAILY_GPT_BUDGET_USD = parseFloat(process.env.DAILY_GPT_BUDGET_USD || '5.0');
+const MODEL = process.env.AZURE_OPENAI_DEPLOYMENT as string;
+
+// ============================================================
+// v4 PRICE MATRIX — hardcoded, no GPT required
+// ============================================================
+
+type CategoryKey = 'стоматология' | 'юристы' | 'автосервис' | 'строители' | 'default';
+
+const PRICES: Record<string, Partial<Record<CategoryKey, string>>> = {
+  'реактивация базы': {
+    'default': 'от 40 000 тг за запуск',
+  },
+  '2GIS оформление': {
+    'default': '50-80к тенге',
+  },
+  'лендинг': {
+    'стоматология': '250-300к тенге',
+    'юристы':       '250-350к тенге',
+    'автосервис':   '200-250к тенге',
+    'строители':    '250-400к тенге',
+    'default':      '250-300к тенге',
+  },
+  'редизайн сайта': {
+    'default': '250-300к тенге',
+  },
+  'бот записи и заявок': {
+    'стоматология': '200-250к тенге',
+    'юристы':       '200-250к тенге',
+    'автосервис':   '150-200к тенге',
+    'строители':    '200-250к тенге',
+    'default':      '200-250к тенге',
+  },
+  'стратегия сбора отзывов': {
+    'default': '100-150к тенге',
+  },
+  'Instagram упаковка': {
+    'default': '150-200к тенге',
+  },
+  'AI автоматизация бизнеса': {
+    'default': '400-600к тенге',
+  },
+};
+
+/** Map raw category string to price matrix key */
+function toCategoryKey(category: string): CategoryKey {
+  const c = category.toLowerCase();
+  if (c.includes('стомат'))           return 'стоматология';
+  if (c.includes('юрид') || c.includes('адвокат') || c.includes('нотариус')) return 'юристы';
+  if (c.includes('авто') || c.includes('шиномонт') || c.includes('сто'))     return 'автосервис';
+  if (c.includes('строит') || c.includes('ремонт'))                           return 'строители';
+  return 'default';
+}
+
+function getPrice(offer: string, category: string): string {
+  const catKey = toCategoryKey(category);
+  const offerPrices = PRICES[offer];
+  if (!offerPrices) return '100-200к тенге';
+  return offerPrices[catKey] || offerPrices['default'] || '100-200к тенге';
+}
+
+/** Extract mid-point of price range for gpt_price storage */
+function parseMidPrice(priceRange: string): number {
+  const nums = priceRange.match(/\d+/g);
+  if (!nums || nums.length < 2) return 150000;
+  const low = parseInt(nums[0]) * 1000;
+  const high = parseInt(nums[1]) * 1000;
+  return Math.round((low + high) / 2);
+}
+
+// ============================================================
+// v4 SCORING — pure rule-based, no GPT
+// ============================================================
+
+function calculateScore(b: BusinessRecord): number {
+  let score = 0;
+  if (!b.website)               score += 40;  // No website — biggest signal
+  if (b.rating < 4.3)           score += 25;  // Low rating
+  if (b.reviews_count < 30)     score += 20;  // Few reviews
+  if (!b.has_socials)           score += 15;  // No social presence
+  // 2GIS profile pain signals
+  if (!b.has_photo)             score += 30;  // No photos on 2GIS
+  if (!b.has_description)       score += 25;  // No description
+  if (!b.has_hours)             score += 20;  // No working hours
+  return score;
+}
+
+// ============================================================
+// v4 OFFER WATERFALL — determines the single best offer
+// ============================================================
+
+function determineOffer(b: BusinessRecord): string {
+  // SINGLE PRODUCT: client-base reactivation. All target niches (салоны, барберы,
+  // стоматологии, автосервисы, кафе, фитнес...) are returning-customer businesses
+  // with a phone base, so reactivation is the offer for every lead.
+  return 'реактивация базы';
+}
+
+// ============================================================
+// GPT — only for score >= 60, one short call for "main pain"
+// ============================================================
+
+async function getMainPain(b: BusinessRecord): Promise<string> {
+  const prompt = `Бизнес: ${b.name} (${b.category}, ${b.city})
+Данные: рейтинг ${b.rating}, отзывов ${b.reviews_count}, сайт: ${b.website ? 'есть' : 'нет'}, соцсети: ${b.has_socials ? 'есть' : 'нет'}
+
+Сформулируй главную боль этого бизнеса в одном коротком предложении (максимум 15 слов). Только текст, без объяснений.`;
+
+  const response = await openai.chat.completions.create({
+    model: MODEL,
+    messages: [{ role: 'user', content: prompt }],
+    max_completion_tokens: 60,
+    temperature: 0.3,
+  });
+
+  if (response.usage) {
+    dbHelpers.logApiCost('analyzer_pain', MODEL, response.usage.prompt_tokens, response.usage.completion_tokens);
+  }
+
+  return response.choices[0].message.content?.trim() || 'Слабое онлайн-присутствие снижает поток клиентов';
+}
+
+// ============================================================
+// MAIN ANALYZER LOOP
+// ============================================================
+
 export async function runAnalyzer() {
-  logger.info('Starting GPT-5.1 analyzer');
-  
+  logger.info('Starting analyzer v4 (rule-based scoring)');
+
   const businesses = dbHelpers.getUnanalyzed();
   if (businesses.length === 0) {
     logger.info('No new businesses to analyze');
     return;
   }
-  
+
   logger.info(`Analyzing ${businesses.length} businesses...`);
-  
+
   for (const business of businesses) {
     try {
-      const analysisResult = await analyzeBusiness(business);
-      
-      let channel = null;
-      if (analysisResult.score >= 75) channel = 'WhatsApp';
-      else if (analysisResult.score >= 51) channel = 'Telegram';
-      
+      // Step 1: Rule-based score (no GPT) — always runs regardless of budget
+      const score = calculateScore(business);
+
+      // Skip low-score leads entirely
+      if (score < 60) {
+        logger.info(`Skipping ${business.name}: score ${score} (below 60 threshold)`);
+        dbHelpers.updateAnalysis(business.id, score, [], {}, '', 0, '', '');
+        continue;
+      }
+
+      // Step 2: Determine offer (no GPT)
+      const offer = determineOffer(business);
+      const priceRange = getPrice(offer, business.category);
+      const gptPrice = parseMidPrice(priceRange);
+
+      // Step 3: GPT only for main pain — only if budget allows, otherwise use default
+      let mainPain = 'Слабое онлайн-присутствие снижает поток клиентов';
+      const costSoFar = dbHelpers.getTodayApiCost();
+      if (costSoFar < DAILY_GPT_BUDGET_USD) {
+        try {
+          mainPain = await getMainPain(business);
+        } catch (e: any) {
+          logger.warn(`GPT pain call failed for ${business.name}: ${e.message}. Using default.`);
+        }
+      }
+
+      // Step 4: Determine channel based on score
+      const hasPhone = business.phone && business.phone.trim() !== '';
+      const hasTgUser = (business.website && /(?:t\.me\/|telegram\.me\/|@)[a-zA-Z0-9_]{5,32}/i.test(business.website)) ||
+                        (business.url && /(?:t\.me\/|telegram\.me\/|@)[a-zA-Z0-9_]{5,32}/i.test(business.url));
+
+      const isWADisabled = process.env.DISABLE_WHATSAPP === 'true';
+      let channel = '';
+
+      if (hasPhone || hasTgUser) {
+        if (score >= 75 && !isWADisabled && hasPhone) {
+          channel = 'WhatsApp';
+        } else {
+          channel = 'Telegram';
+        }
+      }
+
+      // Store problems as an array with the main pain
+      const problems = [{ title: mainPain, impact: '', solution: offer }];
+
       dbHelpers.updateAnalysis(
         business.id,
-        analysisResult.score,
-        analysisResult.problems,
-        analysisResult.market_analysis,
-        channel || '',
-        analysisResult.gpt_price
+        score,
+        problems,
+        { offer, priceRange },
+        channel,
+        gptPrice,
+        offer,
+        priceRange,
       );
-      
-      logger.info(`Analyzed ${business.name}: Score ${analysisResult.score}, Channel: ${channel}`);
-      
+
+      logger.info(`✅ Analyzed ${business.name}: Score ${score}, Offer: ${offer} (${priceRange}), Channel: ${channel}`);
+
     } catch (err: any) {
-      logger.error(`Error analyzing business ${business.name}: ${err.message}`);
+      logger.error(`Error analyzing ${business.name}: ${err.message}`);
     }
   }
-  
+
   logger.info('Analyzer finished');
 }
 
-async function analyzeBusiness(b: BusinessRecord) {
-  let websiteContext = '';
-  if (b.website) {
-    logger.info(`Fetching website context for ${b.website} using agent-browser...`);
-    try {
-      await execPromise(`npx agent-browser open ${b.website}`);
-      const { stdout } = await execPromise(`npx agent-browser snapshot --max-output 3000`);
-      websiteContext = `\nДанные с сайта бизнеса (получены через agent-browser):\n${stdout}\n`;
-    } catch (err: any) {
-      logger.warn(`Failed to fetch website context for ${b.website}: ${err.message}`);
-    }
-  }
-
-  const prompt = `
-Ты Senior Business Analyst и B2B Sales Strategist в Казахстане. Твоя задача - глубоко проанализировать бизнес и подготовить Market Analysis для дальнейшей отправки холодного сообщения.
-Бизнес из 2GIS:
-- Название: ${b.name}
-- Категория: ${b.category}
-- Город: ${b.city}
-- Есть сайт: ${b.website ? 'Да (' + b.website + ')' : 'Нет'}
-- Есть фото: ${b.has_photo ? 'Да' : 'Нет'}
-- Рейтинг: ${b.rating} (Отзывов: ${b.reviews_count})
-- Есть описание: ${b.has_description ? 'Да' : 'Нет'}
-- Указаны часы работы: ${b.has_hours ? 'Да' : 'Нет'}
-- Есть соцсети: ${b.has_socials ? 'Да' : 'Нет'}
-${websiteContext}
-
-ПРАВИЛА И СТОИМОСТЬ УСЛУГ (для расчета gpt_price):
-- 2GIS профиль (оформление): 60,000-150,000 тг
-- Google My Business: 80,000-180,000 тг
-- Kaspi магазин: 80,000-200,000 тг
-- Landing page (Tilda/Wix): 150,000-400,000 тг
-- Многостраничный сайт: 300,000-800,000 тг
-- Instagram (дизайн + 9 постов): 120,000-300,000 тг
-- WhatsApp Business автоответы: 60,000-150,000 тг
-- Telegram чатбот: 200,000-500,000 тг
-- SEO оптимизация: 120,000-250,000 тг
-- Онлайн-запись/бронирование: 150,000-400,000 тг
-- Фото для профиля (10-20 фото, ретушь): 50,000-120,000 тг
-- Электронное меню/прайс: 40,000-100,000 тг
-
-МУЛЬТИПЛИКАТОРЫ (примени к базовой цене):
-- Город Almaty/Astana: x1.5
-- Крупный бизнес или сеть (судя по отзывам/сайту): x2
-- Мелкий региональный бизнес: x0.7
-- Если предлагаем несколько услуг вместе: скидка 15%
-
-ВЫХОДНЫЕ ДАННЫЕ СТРОГО В JSON (без markdown):
-{
-  "market_analysis": {
-    "what_matters_most": "Что важнее всего для клиентов этой категории в Казахстане?",
-    "revenue_hurdles": "Какие реальные проблемы сейчас убивают их доход?",
-    "competitors_advantage": "Что конкуренты в их городе делают лучше?",
-    "realistic_price_range": "Реалистичный диапазон бюджета для них"
-  },
-  "problems": [
-    {
-      "title": "название проблемы (конкретно: нет фото, нет сайта, низкий рейтинг и тд)",
-      "impact": "влияние на выручку",
-      "solution": "что именно мы предложим сделать"
-    }
-  ],
-  "score": 85, // 0-50: скипаем, 51-74: Telegram, 75-100: WhatsApp
-  "gpt_price": 150000 // Итоговая рассчитанная цена (число, в тенге)
-}
-`;
-
-  const response = await openai.chat.completions.create({
-    model: process.env.AZURE_OPENAI_DEPLOYMENT as string,
-    messages: [
-      { role: "system", content: "You are an expert marketing analyzer. Always return valid JSON." },
-      { role: "user", content: prompt }
-    ],
-    temperature: 0.3,
-  });
-
-  const content = response.choices[0].message.content?.trim();
-  if (!content) throw new Error("Empty response from GPT");
-  
-  const cleanJson = content.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-  return JSON.parse(cleanJson);
-}
-
-// Allow running directly
 if (require.main === module) {
   runAnalyzer().catch(console.error);
 }
